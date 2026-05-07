@@ -1,0 +1,15 @@
+# Credentials
+.env
+
+# Output files
+*.xlsx
+*.csv
+*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+gh_installer.msi
