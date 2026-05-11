@@ -1,6 +1,6 @@
 # Credentials
 .env
-
+.claude
 # Output files
 *.xlsx
 *.csv
