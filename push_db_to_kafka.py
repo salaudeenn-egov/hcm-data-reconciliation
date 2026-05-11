@@ -1,28 +1,3 @@
-"""
-push_db_to_kafka.py
-Push DB records missing from Elasticsearch directly into Kafka.
-The ES indexer picks them up and re-syncs to ES.
-
-Flow:
-  1. Fetch IDs from DB        (DB_QUERY)
-  2. Fetch IDs from ES        (ES_QUERY_BODY + scroll)
-  3. Compute missing          (DB - ES)
-  4. Fetch full objects from HCM search API (batched)
-  5. Filter isDeleted + null required fields
-  6. Push API response objects directly to Kafka (no manual transform)
-  7. Summary
-
-Credentials are read from environment variables / .env file.
-Set these before running:
-  DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DB_SSLMODE
-  ES_BASE_URL, ES_USERNAME_B64, ES_PASSWORD_B64
-  KAFKA_BOOTSTRAP_SERVERS
-  API_BASE, AUTH_TOKEN, TENANT_ID
-
-Usage:
-  python push_db_to_kafka.py
-"""
-
 import base64
 import gc
 import json
@@ -41,9 +16,7 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 load_dotenv()
 
-# =====================================================
-# DB CONFIG — from environment variables
-# =====================================================
+# ── CREDENTIALS (from .env) ───────────────────────────────────────────────────
 DB_HOST            = os.environ["DB_HOST"]
 DB_PORT            = int(os.environ.get("DB_PORT", 5432))
 DB_NAME            = os.environ["DB_NAME"]
@@ -52,76 +25,45 @@ DB_PASSWORD        = os.environ["DB_PASSWORD"]
 DB_SSLMODE         = os.environ.get("DB_SSLMODE", "require")
 DB_CONNECT_TIMEOUT = 30
 
-# =====================================================
-# ES CONFIG — from environment variables
-# =====================================================
 ES_BASE_URL     = os.environ["ES_BASE_URL"]
 ES_USERNAME_B64 = os.environ["ES_USERNAME_B64"]
 ES_PASSWORD_B64 = os.environ["ES_PASSWORD_B64"]
-ES_SCROLL_TIME  = "2m"
-ES_BATCH_SIZE   = 1000
 
-# =====================================================
-# KAFKA CONFIG — from environment variables
-# =====================================================
 KAFKA_BOOTSTRAP_SERVERS = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
-# =====================================================
-# HCM API CONFIG — from environment variables
-# =====================================================
-API_BASE   = os.environ["API_BASE"]    # e.g. https://mozambique-hcm.digit.org
-AUTH_TOKEN = os.environ["AUTH_TOKEN"]  # OAuth token
-TENANT_ID  = os.environ["TENANT_ID"]  # e.g. mz, ko, bo
+API_BASE   = os.environ["API_BASE"]
+AUTH_TOKEN = os.environ["AUTH_TOKEN"]
+TENANT_ID  = os.environ["TENANT_ID"]
 
-# =====================================================
-# ENTITY CONFIG — update per campaign / category
-# (not secrets — edit directly in this file)
-# =====================================================
-ENTITY_TYPE = "project_task"            # project_task | stock | project_beneficiary
+# ── CAMPAIGN CONFIG (edit per run) ────────────────────────────────────────────
 
-DB_TABLE    = "bo.project_task"         # update schema prefix per campaign e.g. ko, bo, oy
-DB_ID_COL   = "clientreferenceid"
+# Central instance → schema per tenant (bo, so, ko ...)
+# Individual instance → no schema prefix
+IS_CENTRAL_INSTANCE = True
+DB_SCHEMA           = "so"
 
-KAFKA_TOPIC = "save-project-task"       # configurable — update per entity
+ENTITY_TYPE = "project_task"   # project_task | stock | project_beneficiary
 
-ES_INDEX    = "bo-project-task-index-v1"
-ES_ID_FIELD = "Data.taskClientReferenceId"   # dot-path to ID field in ES _source
+KAFKA_TOPIC = "save-project-task"
 
-# HCM API search endpoint and payload keys — update per entity
-#
-# project_task:
-#   API_SEARCH_PATH  = "/project/task/v1/_search"
-#   API_REQUEST_KEY  = "Task"
-#   API_RESPONSE_KEY = "Task"
-#   API_SEARCH_FIELD = "clientReferenceId"
-#   API_PARAMS       = {"limit": 200, "offset": 0, "tenantId": TENANT_ID, "includeDeleted": "true"}
-#
-# stock:
-#   API_SEARCH_PATH  = "/stock/v1/_search"
-#   API_REQUEST_KEY  = "Stock"
-#   API_RESPONSE_KEY = "Stock"
-#   API_SEARCH_FIELD = "id"
-#   API_PARAMS       = {"limit": 100, "offset": 0, "tenantId": TENANT_ID}
-#
-# project_beneficiary:
-#   API_SEARCH_PATH  = "/project/beneficiary/v1/_search"
-#   API_REQUEST_KEY  = "ProjectBeneficiary"
-#   API_RESPONSE_KEY = "ProjectBeneficiary"
-#   API_SEARCH_FIELD = "clientReferenceId"
-#   API_PARAMS       = {"limit": 100, "offset": 0, "tenantId": TENANT_ID}
+ES_INDEX_BASE = "project-task-index-v1"   # prefix (so-, bo-) is auto-added from DB_SCHEMA
+ES_ID_FIELD   = "Data.taskClientReferenceId"
 
+# project_task:        /project/task/v1/_search         Task              clientReferenceId   limit=200
+# stock:               /stock/v1/_search                Stock             id                  limit=100
+# project_beneficiary: /project/beneficiary/v1/_search  ProjectBeneficiary clientReferenceId  limit=100
 API_SEARCH_PATH  = "/project/task/v1/_search"
 API_REQUEST_KEY  = "Task"
 API_RESPONSE_KEY = "Task"
-API_SEARCH_FIELD = "clientReferenceId"   # field used inside request body to search by
-API_PARAMS       = {                     # query params — update per entity
+API_SEARCH_FIELD = "clientReferenceId"
+API_PARAMS       = {
     "limit":          200,
     "offset":         0,
     "tenantId":       TENANT_ID,
     "includeDeleted": "true",
 }
 
-# Fields that must be non-null in the API response before pushing to Kafka
+# Drop records missing any of these fields in the API response
 # project_task        → ["clientReferenceId", "projectBeneficiaryClientReferenceId"]
 # stock               → ["clientReferenceId", "facilityId"]
 # project_beneficiary → ["clientReferenceId", "beneficiaryClientReferenceId"]
@@ -130,14 +72,39 @@ REQUIRED_FIELDS = [
     "projectBeneficiaryClientReferenceId",
 ]
 
-# =====================================================
-# DB QUERY — update per campaign / category
-# =====================================================
+# Records created by users with these keywords in their username are skipped
+TEST_USER_KEYWORDS = ["test", "demo", "uat", "qa"]
+
+# ── RUNTIME SETTINGS ──────────────────────────────────────────────────────────
+ES_SCROLL_TIME    = "2m"
+ES_BATCH_SIZE     = 1000
+DB_CHUNK_SIZE     = 10000
+API_BATCH_SIZE    = 100
+KAFKA_FLUSH_EVERY = 1000
+
+# ── DERIVED (auto-built from config above) ────────────────────────────────────
+_s        = f"{DB_SCHEMA}." if IS_CENTRAL_INSTANCE else ""
+_es       = f"{DB_SCHEMA}-" if IS_CENTRAL_INSTANCE else ""
+
+DB_TABLE  = f"{_s}project_task"
+DB_ID_COL = "clientreferenceid"
+ES_INDEX  = f"{_es}{ES_INDEX_BASE}"
+
+_test_user_filter = " OR ".join(
+    f"i.username ILIKE '%{kw}%'" for kw in TEST_USER_KEYWORDS
+)
+
 DB_QUERY = f"""
 SELECT {DB_ID_COL}
-FROM bo.project_task pt
-JOIN bo.project p ON pt.projectid = p.id
+FROM {_s}project_task pt
+JOIN {_s}project p ON pt.projectid = p.id
 WHERE pt.status = 'ADMINISTRATION_SUCCESS'
+AND (pt.isdeleted = false OR pt.isdeleted IS NULL)
+AND NOT EXISTS (
+    SELECT 1 FROM {_s}individual i
+    WHERE i.useruuid = pt.createdby
+    AND ({_test_user_filter})
+)
 AND EXISTS (
     SELECT 1
     FROM jsonb_array_elements(pt.additionaldetails->'fields') f
@@ -146,9 +113,6 @@ AND EXISTS (
 )
 """
 
-# =====================================================
-# ES QUERY BODY — update per campaign / category
-# =====================================================
 ES_QUERY_BODY = {
     "query": {
         "bool": {
@@ -175,14 +139,7 @@ ES_QUERY_BODY = {
     }
 }
 
-# =====================================================
-# RUNTIME SETTINGS
-# =====================================================
-DB_CHUNK_SIZE     = 10000   # IDs per DB IN query
-API_BATCH_SIZE    = 100     # IDs per HCM API search call
-KAFKA_FLUSH_EVERY = 1000    # flush Kafka producer every N messages
-FAILED_JSON       = f"failed_kafka_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-
+FAILED_JSON  = f"failed_kafka_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 REQUEST_INFO = {
     "apiId":     "Rainmaker",
     "ver":       ".01",
@@ -195,9 +152,7 @@ REQUEST_INFO = {
     "userInfo":  None,
 }
 
-# =====================================================
-# HELPERS
-# =====================================================
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def get_es_headers():
     username = base64.b64decode(ES_USERNAME_B64).decode()
@@ -211,7 +166,7 @@ def get_es_headers():
 
 def fetch_db_ids(conn):
     ids = set()
-    with conn.cursor(name="db_ids_cursor") as cur:   # server-side cursor — streams rows
+    with conn.cursor(name="db_ids_cursor") as cur:
         cur.execute(DB_QUERY)
         while True:
             rows = cur.fetchmany(50000)
@@ -258,7 +213,6 @@ def fetch_es_ids(headers):
 
 
 def fetch_objects_from_api(ids):
-    """Call HCM search API in batches, yield individual objects."""
     api_url = f"{API_BASE}{API_SEARCH_PATH}"
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
@@ -273,18 +227,12 @@ def fetch_objects_from_api(ids):
                 api_url, headers=headers, params=API_PARAMS, json=payload, timeout=60
             )
             resp.raise_for_status()
-            objects = resp.json().get(API_RESPONSE_KEY, [])
-            yield from objects
+            yield from resp.json().get(API_RESPONSE_KEY, [])
         except Exception as e:
             print(f"\n  API batch failed (ids {i}–{i + len(batch)}): {e}")
 
 
-def is_deleted(obj):
-    return str(obj.get("isDeleted", "false")).lower() in ("true", "1")
-
-
 def null_required_field(obj):
-    """Return the first required field that is null/empty, or None if all present."""
     for field in REQUIRED_FIELDS:
         val = obj.get(field)
         if val is None or str(val).strip() in ("", "None", "nan"):
@@ -303,20 +251,18 @@ def make_producer():
     )
 
 
-# =====================================================
-# MAIN
-# =====================================================
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
     print(f"\n{'='*58}")
     print(f"  Entity   : {ENTITY_TYPE}")
+    print(f"  Schema   : {_s.rstrip('.') or '(none)'}")
     print(f"  Table    : {DB_TABLE}")
     print(f"  ES Index : {ES_INDEX}")
     print(f"  Topic    : {KAFKA_TOPIC}")
     print(f"  API      : {API_BASE}{API_SEARCH_PATH}")
     print(f"{'='*58}")
 
-    # STEP 1 — DB IDs
     print("\nSTEP 1 — Fetching IDs from DB")
     try:
         conn   = psycopg2.connect(
@@ -331,7 +277,6 @@ def main():
         print(f"  DB Error: {e}")
         sys.exit(1)
 
-    # STEP 2 — ES IDs
     print("\nSTEP 2 — Fetching IDs from ES")
     try:
         es_ids = fetch_es_ids(get_es_headers())
@@ -340,7 +285,6 @@ def main():
         print(f"  ES Error: {e}")
         sys.exit(1)
 
-    # STEP 3 — Compare
     print("\nSTEP 3 — Comparing")
     missing = list(db_ids - es_ids)
     print(f"  Matched       : {len(db_ids & es_ids):,}")
@@ -353,13 +297,11 @@ def main():
     del db_ids, es_ids
     gc.collect()
 
-    # STEP 4 — Fetch from HCM API + push to Kafka
     print(f"\nSTEP 4 — Fetching from HCM API + Pushing to Kafka [{KAFKA_TOPIC}]")
     print(f"  Batching {len(missing):,} IDs in groups of {API_BATCH_SIZE} ...")
 
     producer          = make_producer()
     pushed            = 0
-    dropped_deleted   = 0
     dropped_null      = 0
     failures          = []
     send_count        = 0
@@ -374,13 +316,6 @@ def main():
             record_id = str(obj.get("clientReferenceId", ""))
             returned_ids.add(record_id)
 
-            # filter isDeleted
-            if is_deleted(obj):
-                dropped_deleted += 1
-                pbar.update(1)
-                continue
-
-            # filter null required fields
             bad_field = null_required_field(obj)
             if bad_field:
                 dropped_null += 1
@@ -390,7 +325,7 @@ def main():
 
             try:
                 payload = {
-                    "RequestInfo":   REQUEST_INFO,
+                    "RequestInfo":    REQUEST_INFO,
                     API_RESPONSE_KEY: obj,
                 }
                 future = producer.send(KAFKA_TOPIC, key=record_id, value=payload)
@@ -407,21 +342,17 @@ def main():
 
     producer.flush()
 
-    # IDs in missing list but not returned by API at all
     not_in_api = len(set(missing) - returned_ids)
 
-    # STEP 5 — Save failures
     if failures:
         with open(FAILED_JSON, "w") as f:
             json.dump(failures, f, indent=2, default=str)
 
-    # STEP 6 — Summary
     print(f"\n{'='*58}")
     print(f"  SUMMARY")
     print(f"{'='*58}")
     print(f"  Missing in ES        : {len(missing):,}")
     print(f"  Pushed to Kafka      : {pushed:,}")
-    print(f"  Dropped (deleted)    : {dropped_deleted:,}")
     print(f"  Dropped (null field) : {dropped_null:,}")
     if null_field_counts:
         for field, count in null_field_counts.items():
