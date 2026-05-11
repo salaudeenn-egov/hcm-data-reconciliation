@@ -99,7 +99,7 @@ JOBS = [
         "api_base":         "http://project.egov:8080",
         "api_search_path":  "/project/task/v1/_search",
         "api_request_key":  "Task",
-        "api_response_key": "Task",
+        "api_response_key": "Tasks",
         "api_search_field": "clientReferenceId",
         "required_fields":  ["clientReferenceId", "projectBeneficiaryClientReferenceId"],
     },
