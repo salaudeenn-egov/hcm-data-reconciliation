@@ -27,6 +27,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler(f"logs/push_db_to_kafka_{datetime.now().strftime('%Y%m%d')}.log"),
+        logging.StreamHandler(),
     ]
 )
 
@@ -109,8 +110,8 @@ JOBS = [
 # RUNTIME SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
 
-ES_SCROLL_TIME    = "2m"
-ES_BATCH_SIZE     = 1000
+ES_SCROLL_TIME    = "5m"
+ES_BATCH_SIZE     = 5000
 API_BATCH_SIZE    = 100
 KAFKA_FLUSH_EVERY = 1000
 
@@ -167,6 +168,7 @@ def fetch_es_ids(headers, es_index, es_query_body, es_id_field):
     scroll_id = data["_scroll_id"]
     hits      = data["hits"]["hits"]
 
+    batch_num = 0
     while hits:
         for hit in hits:
             val = hit.get("_source", {})
@@ -174,6 +176,10 @@ def fetch_es_ids(headers, es_index, es_query_body, es_id_field):
                 val = val.get(key, {}) if isinstance(val, dict) else None
             if val:
                 ids.add(str(val))
+
+        batch_num += 1
+        if batch_num % 10 == 0:
+            log.info("  ES scroll: %d batches / ~%d ids so far", batch_num, len(ids))
 
         res       = requests.post(
             f"{ES_BASE_URL}/_search/scroll",
@@ -197,7 +203,8 @@ def fetch_objects_from_api(ids, job):
     }
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
-    for i in range(0, len(ids), API_BATCH_SIZE):
+    total = len(ids)
+    for i in range(0, total, API_BATCH_SIZE):
         batch   = ids[i:i + API_BATCH_SIZE]
         payload = {
             "RequestInfo":          {"authToken": AUTH_TOKEN},
@@ -211,6 +218,8 @@ def fetch_objects_from_api(ids, job):
             yield from resp.json().get(job["api_response_key"], [])
         except Exception as e:
             log.error("API batch failed (ids %d–%d): %s", i, i + len(batch), e)
+        if (i // API_BATCH_SIZE + 1) % 10 == 0:
+            log.info("  API fetch: %d / %d done", min(i + API_BATCH_SIZE, total), total)
 
 
 def null_required_field(obj, required_fields):
