@@ -4,16 +4,18 @@ import json
 import logging
 import os
 import sys
+import time
+import uuid
 import warnings
 from datetime import datetime
 
 import psycopg2
-import psycopg2.extras
 import requests
 from dotenv import load_dotenv
 from kafka import KafkaProducer
+from urllib3.exceptions import InsecureRequestWarning
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -37,6 +39,15 @@ log = logging.getLogger(__name__)
 # CREDENTIALS
 # ─────────────────────────────────────────────────────────────────────────────
 
+_REQUIRED_VARS = [
+    "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD",
+    "ES_BASE_URL", "ES_USERNAME_B64", "ES_PASSWORD_B64",
+    "KAFKA_BOOTSTRAP_SERVERS", "AUTH_TOKEN",
+]
+_missing_vars = [v for v in _REQUIRED_VARS if not os.environ.get(v)]
+if _missing_vars:
+    raise SystemExit(f"Missing required env vars: {', '.join(_missing_vars)}")
+
 DB_HOST            = os.environ["DB_HOST"]
 DB_PORT            = int(os.environ.get("DB_PORT", 5432))
 DB_NAME            = os.environ["DB_NAME"]
@@ -50,8 +61,7 @@ ES_USERNAME_B64 = os.environ["ES_USERNAME_B64"]
 ES_PASSWORD_B64 = os.environ["ES_PASSWORD_B64"]
 
 KAFKA_BOOTSTRAP_SERVERS = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
-
-AUTH_TOKEN = os.environ["AUTH_TOKEN"]
+AUTH_TOKEN              = os.environ["AUTH_TOKEN"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMPAIGN CONFIG
@@ -113,6 +123,7 @@ JOBS = [
 ES_SCROLL_TIME    = "5m"
 ES_BATCH_SIZE     = 5000
 API_BATCH_SIZE    = 100
+API_RETRIES       = 3
 KAFKA_FLUSH_EVERY = 1000
 
 REQUEST_INFO = {
@@ -126,6 +137,9 @@ REQUEST_INFO = {
     "authToken": AUTH_TOKEN,
     "userInfo":  None,
 }
+
+# Kafka payloads omit authToken — downstream consumers don't need it
+_KAFKA_REQUEST_INFO = {k: v for k, v in REQUEST_INFO.items() if k != "authToken"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -142,8 +156,9 @@ def get_es_headers():
 
 
 def fetch_db_ids(conn, query):
-    ids = set()
-    with conn.cursor(name="db_ids_cursor") as cur:
+    ids         = set()
+    cursor_name = f"db_cur_{uuid.uuid4().hex[:12]}"
+    with conn.cursor(name=cursor_name) as cur:
         cur.execute(query)
         while True:
             rows = cur.fetchmany(50000)
@@ -159,67 +174,100 @@ def fetch_es_ids(headers, es_index, es_query_body, es_id_field):
     ids        = set()
     field_path = tuple(es_id_field.split("."))
     query      = {**es_query_body, "_source": [es_id_field], "size": ES_BATCH_SIZE}
+    scroll_id  = None
 
-    res       = requests.post(
-        f"{ES_BASE_URL}/{es_index}/_search?scroll={ES_SCROLL_TIME}",
-        headers=headers, data=json.dumps(query), verify=False,
-    )
-    data      = res.json()
-    scroll_id = data["_scroll_id"]
-    hits      = data["hits"]["hits"]
-
-    batch_num = 0
-    while hits:
-        for hit in hits:
-            val = hit.get("_source", {})
-            for key in field_path:
-                val = val.get(key, {}) if isinstance(val, dict) else None
-            if val:
-                ids.add(str(val))
-
-        batch_num += 1
-        if batch_num % 10 == 0:
-            log.info("  ES scroll: %d batches / ~%d ids so far", batch_num, len(ids))
-
-        res       = requests.post(
-            f"{ES_BASE_URL}/_search/scroll",
-            headers=headers,
-            data=json.dumps({"scroll": ES_SCROLL_TIME, "scroll_id": scroll_id}),
-            verify=False,
+    try:
+        res = requests.post(
+            f"{ES_BASE_URL}/{es_index}/_search?scroll={ES_SCROLL_TIME}",
+            headers=headers, data=json.dumps(query), verify=False,
         )
-        data      = res.json()
-        hits      = data["hits"]["hits"]
+        res.raise_for_status()
+        data = res.json()
+        if "error" in data:
+            raise RuntimeError(f"ES error: {data['error']}")
+
         scroll_id = data["_scroll_id"]
+        hits      = data["hits"]["hits"]
+        batch_num = 0
+
+        while hits:
+            for hit in hits:
+                val = hit.get("_source", {})
+                for key in field_path:
+                    val = val.get(key, {}) if isinstance(val, dict) else None
+                if val:
+                    ids.add(str(val))
+
+            batch_num += 1
+            if batch_num % 10 == 0:
+                log.info("  ES scroll: %d batches / ~%d ids so far", batch_num, len(ids))
+
+            res = requests.post(
+                f"{ES_BASE_URL}/_search/scroll",
+                headers=headers,
+                data=json.dumps({"scroll": ES_SCROLL_TIME, "scroll_id": scroll_id}),
+                verify=False,
+            )
+            res.raise_for_status()
+            data = res.json()
+            if "error" in data:
+                raise RuntimeError(f"ES scroll error: {data['error']}")
+            hits      = data["hits"]["hits"]
+            scroll_id = data.get("_scroll_id", scroll_id)
+
+    finally:
+        if scroll_id:
+            try:
+                requests.delete(
+                    f"{ES_BASE_URL}/_search/scroll",
+                    headers=headers,
+                    json={"scroll_id": scroll_id},
+                    verify=False,
+                )
+            except Exception:
+                pass
 
     return ids
 
 
 def fetch_objects_from_api(ids, job):
+    """Returns (objects, failed_batches). failed_batches contains IDs that could not be fetched after retries."""
     api_url = f"{job['api_base']}{job['api_search_path']}"
-    params  = {
-        "limit":    200,
-        "offset":   0,
-        "tenantId": job["tenant_id"],
-    }
+    params  = {"limit": 200, "offset": 0, "tenantId": job["tenant_id"]}
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
-    total = len(ids)
+    objects        = []
+    failed_batches = []
+    total          = len(ids)
+
     for i in range(0, total, API_BATCH_SIZE):
         batch   = ids[i:i + API_BATCH_SIZE]
         payload = {
             "RequestInfo":          {"authToken": AUTH_TOKEN},
             job["api_request_key"]: {job["api_search_field"]: batch},
         }
-        try:
-            resp = requests.post(
-                api_url, headers=headers, params=params, json=payload, timeout=60
-            )
-            resp.raise_for_status()
-            yield from resp.json().get(job["api_response_key"], [])
-        except Exception as e:
-            log.error("API batch failed (ids %d–%d): %s", i, i + len(batch), e)
+        for attempt in range(API_RETRIES):
+            try:
+                resp = requests.post(
+                    api_url, headers=headers, params=params, json=payload, timeout=60
+                )
+                resp.raise_for_status()
+                objects.extend(resp.json().get(job["api_response_key"], []))
+                break
+            except Exception as e:
+                if attempt == API_RETRIES - 1:
+                    log.error("API batch failed after %d attempts (offset %d): %s", API_RETRIES, i, e)
+                    failed_batches.append({"offset": i, "ids": batch, "error": str(e)})
+                else:
+                    wait = 2 ** attempt
+                    log.warning("  API attempt %d/%d failed, retrying in %ds: %s",
+                                attempt + 1, API_RETRIES, wait, e)
+                    time.sleep(wait)
+
         if (i // API_BATCH_SIZE + 1) % 10 == 0:
             log.info("  API fetch: %d / %d done", min(i + API_BATCH_SIZE, total), total)
+
+    return objects, failed_batches
 
 
 def null_required_field(obj, required_fields):
@@ -236,8 +284,12 @@ def make_producer():
         security_protocol="PLAINTEXT",
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
-        retries=3,
+        enable_idempotence=True,
         acks="all",
+        retries=10,
+        max_in_flight_requests_per_connection=5,
+        linger_ms=20,
+        batch_size=65536,
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,8 +297,9 @@ def make_producer():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_job(job, conn, producer, es_headers):
-    name = job["name"]
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name      = job["name"]
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = name.replace(" ", "_").replace("/", "-")
 
     log.info("Job started: %s | tenant=%s | index=%s | topic=%s",
              name, job["tenant_id"], job["es_index"], job["kafka_topic"])
@@ -256,40 +309,54 @@ def run_job(job, conn, producer, es_headers):
         log.info("DB: %d records", len(db_ids))
     except Exception as e:
         log.error("DB fetch failed: %s", e)
-        return
+        return True  # has_failures
 
     try:
         es_ids = fetch_es_ids(es_headers, job["es_index"], job["es_query_body"], job["es_id_field"])
         log.info("ES: %d records", len(es_ids))
     except Exception as e:
         log.error("ES fetch failed: %s", e)
-        return
+        return True  # has_failures
 
     missing = list(db_ids - es_ids)
     log.info("Matched: %d | Missing in ES: %d", len(db_ids & es_ids), len(missing))
 
     if not missing:
         log.info("In sync. Nothing to push.")
-        return
+        return False
 
     del db_ids, es_ids
     gc.collect()
 
     log.info("Fetching %d records from API and pushing to Kafka (batch=%d)", len(missing), API_BATCH_SIZE)
 
+    objects, api_failures = fetch_objects_from_api(missing, job)
+
+    if api_failures:
+        failed_api_file = f"failed_api_{safe_name}_{ts}.json"
+        with open(failed_api_file, "w") as f:
+            json.dump(api_failures, f, indent=2, default=str)
+        total_api_failed_ids = sum(len(fb["ids"]) for fb in api_failures)
+        for fb in api_failures:
+            log.warning("API_FAILED offset=%d ids=%s", fb["offset"], ",".join(fb["ids"][:3]))
+        log.warning("API failures: %d batches / %d IDs — saved to %s",
+                    len(api_failures), total_api_failed_ids, failed_api_file)
+
     pushed            = 0
     dropped_null      = 0
     send_count        = 0
-    failures          = []
+    kafka_failures    = []
     null_field_counts = {}
     returned_ids      = set()
 
     def on_send_error(exc, record_id):
-        failures.append({"id": record_id, "error": str(exc)})
+        kafka_failures.append({"id": record_id, "error": str(exc)})
+        log.warning("KAFKA_FAILED id=%s error=%s", record_id, exc)
 
-    for obj in fetch_objects_from_api(missing, job):
+    for obj in objects:
         record_id = str(obj.get("clientReferenceId", ""))
-        returned_ids.add(record_id)
+        if record_id:
+            returned_ids.add(record_id)
 
         bad_field = null_required_field(obj, job["required_fields"])
         if bad_field:
@@ -299,7 +366,7 @@ def run_job(job, conn, producer, es_headers):
 
         try:
             payload = {
-                "RequestInfo":           REQUEST_INFO,
+                "RequestInfo":           _KAFKA_REQUEST_INFO,
                 job["api_response_key"]: obj,
             }
             future = producer.send(job["kafka_topic"], key=record_id, value=payload)
@@ -307,30 +374,36 @@ def run_job(job, conn, producer, es_headers):
             pushed     += 1
             send_count += 1
         except Exception as e:
-            failures.append({"id": record_id, "error": str(e)})
+            kafka_failures.append({"id": record_id, "error": str(e)})
+            log.warning("KAFKA_FAILED id=%s error=%s", record_id, e)
 
         if send_count % KAFKA_FLUSH_EVERY == 0:
-            producer.flush()
+            producer.flush(timeout=300)
 
-    producer.flush()
+    producer.flush(timeout=300)
 
     not_in_api = len(set(missing) - returned_ids)
 
-    if failures:
-        safe_name   = name.replace(" ", "_").replace("/", "-")
-        failed_file = f"failed_kafka_{safe_name}_{ts}.json"
-        with open(failed_file, "w") as f:
-            json.dump(failures, f, indent=2, default=str)
-        log.warning("Kafka failures: %d — saved to %s", len(failures), failed_file)
+    if kafka_failures:
+        failed_kafka_file = f"failed_kafka_{safe_name}_{ts}.json"
+        with open(failed_kafka_file, "w") as f:
+            json.dump(kafka_failures, f, indent=2, default=str)
+        log.warning("Kafka failures: %d — saved to %s", len(kafka_failures), failed_kafka_file)
 
     if null_field_counts:
         for field, count in null_field_counts.items():
             log.warning("Dropped null field '%s': %d records", field, count)
 
+    has_failures = bool(api_failures or kafka_failures)
+
     log.info(
-        "Done | Missing: %d | Fetched: %d | Dropped: %d | Not in API: %d | Pushed: %d | Failures: %d",
-        len(missing), len(returned_ids), dropped_null, not_in_api, pushed, len(failures),
+        "Done | Missing: %d | Fetched: %d | Dropped: %d | Not in API: %d | Pushed: %d | "
+        "API failures: %d | Kafka failures: %d",
+        len(missing), len(returned_ids), dropped_null, not_in_api, pushed,
+        sum(len(fb["ids"]) for fb in api_failures), len(kafka_failures),
     )
+
+    return has_failures
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -349,22 +422,27 @@ def main():
             user=DB_USER, password=DB_PASSWORD,
             sslmode=DB_SSLMODE, connect_timeout=DB_CONNECT_TIMEOUT,
         )
+        conn.autocommit = True
     except Exception as e:
         log.error("DB connection failed: %s", e)
         sys.exit(1)
 
     producer   = make_producer()
     es_headers = get_es_headers()
+    any_failures = False
 
     try:
         for job in JOBS:
-            run_job(job, conn, producer, es_headers)
+            job_failed = run_job(job, conn, producer, es_headers)
+            if job_failed:
+                any_failures = True
     finally:
-        producer.flush()
+        producer.flush(timeout=300)
         producer.close()
         conn.close()
 
     log.info("Reconciliation complete")
+    sys.exit(1 if any_failures else 0)
 
 
 if __name__ == "__main__":
