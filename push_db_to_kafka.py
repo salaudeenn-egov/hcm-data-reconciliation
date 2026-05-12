@@ -18,6 +18,8 @@ from urllib3.exceptions import InsecureRequestWarning
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 load_dotenv()
 
+RUN_ID = uuid.uuid4().hex[:8]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -26,7 +28,7 @@ os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format=f"%(asctime)s [%(levelname)s] [run={RUN_ID}] %(message)s",
     handlers=[
         logging.FileHandler(f"logs/push_db_to_kafka_{datetime.now().strftime('%Y%m%d')}.log"),
         logging.StreamHandler(),
@@ -62,6 +64,7 @@ ES_PASSWORD_B64 = os.environ["ES_PASSWORD_B64"]
 
 KAFKA_BOOTSTRAP_SERVERS = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 AUTH_TOKEN              = os.environ["AUTH_TOKEN"]
+AUDIT_TABLE             = os.environ.get("AUDIT_TABLE", "recon_run_log")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMPAIGN CONFIG
@@ -293,6 +296,65 @@ def make_producer():
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AUDIT LOG
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _audit_start(conn, job):
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO {AUDIT_TABLE}
+                    (run_id, job_name, tenant_id, es_index, kafka_topic, started_at, status)
+                VALUES (%s, %s, %s, %s, %s, NOW(), 'RUNNING')
+                RETURNING id
+            """, (RUN_ID, job["name"], job["tenant_id"], job["es_index"], job["kafka_topic"]))
+            return cur.fetchone()[0]
+    except Exception as e:
+        log.warning("Audit log insert failed: %s", e)
+        return None
+
+
+def _audit_end(conn, row_id, status, counts, error=None):
+    if row_id is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE {AUDIT_TABLE} SET
+                    finished_at      = NOW(),
+                    status           = %s,
+                    db_count         = %s,
+                    es_count         = %s,
+                    matched_count    = %s,
+                    missing_count    = %s,
+                    fetched_count    = %s,
+                    dropped_count    = %s,
+                    not_in_api_count = %s,
+                    pushed_count     = %s,
+                    api_failed_ids   = %s,
+                    kafka_failures   = %s,
+                    error_message    = %s
+                WHERE id = %s
+            """, (
+                status,
+                counts.get("db_count"),
+                counts.get("es_count"),
+                counts.get("matched_count"),
+                counts.get("missing_count"),
+                counts.get("fetched_count"),
+                counts.get("dropped_count"),
+                counts.get("not_in_api_count"),
+                counts.get("pushed_count"),
+                counts.get("api_failed_ids"),
+                counts.get("kafka_failures"),
+                error,
+                row_id,
+            ))
+    except Exception as e:
+        log.warning("Audit log update failed: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # JOB
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -304,106 +366,149 @@ def run_job(job, conn, producer, es_headers):
     log.info("Job started: %s | tenant=%s | index=%s | topic=%s",
              name, job["tenant_id"], job["es_index"], job["kafka_topic"])
 
-    try:
-        db_ids = fetch_db_ids(conn, job["db_query"])
-        log.info("DB: %d records", len(db_ids))
-    except Exception as e:
-        log.error("DB fetch failed: %s", e)
-        return True  # has_failures
+    audit_id = _audit_start(conn, job)
+
+    db_count = es_count = matched_count = missing_count = 0
+    fetched_count = dropped_count = not_in_api_count = pushed_count = 0
+    api_failed_ids_count = kafka_failure_count = 0
 
     try:
-        es_ids = fetch_es_ids(es_headers, job["es_index"], job["es_query_body"], job["es_id_field"])
-        log.info("ES: %d records", len(es_ids))
-    except Exception as e:
-        log.error("ES fetch failed: %s", e)
-        return True  # has_failures
-
-    missing = list(db_ids - es_ids)
-    log.info("Matched: %d | Missing in ES: %d", len(db_ids & es_ids), len(missing))
-
-    if not missing:
-        log.info("In sync. Nothing to push.")
-        return False
-
-    del db_ids, es_ids
-    gc.collect()
-
-    log.info("Fetching %d records from API and pushing to Kafka (batch=%d)", len(missing), API_BATCH_SIZE)
-
-    objects, api_failures = fetch_objects_from_api(missing, job)
-
-    if api_failures:
-        failed_api_file = f"failed_api_{safe_name}_{ts}.json"
-        with open(failed_api_file, "w") as f:
-            json.dump(api_failures, f, indent=2, default=str)
-        total_api_failed_ids = sum(len(fb["ids"]) for fb in api_failures)
-        for fb in api_failures:
-            log.warning("API_FAILED offset=%d ids=%s", fb["offset"], ",".join(fb["ids"][:3]))
-        log.warning("API failures: %d batches / %d IDs — saved to %s",
-                    len(api_failures), total_api_failed_ids, failed_api_file)
-
-    pushed            = 0
-    dropped_null      = 0
-    send_count        = 0
-    kafka_failures    = []
-    null_field_counts = {}
-    returned_ids      = set()
-
-    def on_send_error(exc, record_id):
-        kafka_failures.append({"id": record_id, "error": str(exc)})
-        log.warning("KAFKA_FAILED id=%s error=%s", record_id, exc)
-
-    for obj in objects:
-        record_id = str(obj.get("clientReferenceId", ""))
-        if record_id:
-            returned_ids.add(record_id)
-
-        bad_field = null_required_field(obj, job["required_fields"])
-        if bad_field:
-            dropped_null += 1
-            null_field_counts[bad_field] = null_field_counts.get(bad_field, 0) + 1
-            continue
+        try:
+            db_ids   = fetch_db_ids(conn, job["db_query"])
+            db_count = len(db_ids)
+            log.info("DB: %d records", db_count)
+        except Exception as e:
+            log.error("DB fetch failed: %s", e)
+            _audit_end(conn, audit_id, "FAILED", {}, error=str(e))
+            return True
 
         try:
-            payload = {
-                "RequestInfo":           _KAFKA_REQUEST_INFO,
-                job["api_response_key"]: obj,
-            }
-            future = producer.send(job["kafka_topic"], key=record_id, value=payload)
-            future.add_errback(lambda exc, rid=record_id: on_send_error(exc, rid))
-            pushed     += 1
-            send_count += 1
+            es_ids   = fetch_es_ids(es_headers, job["es_index"], job["es_query_body"], job["es_id_field"])
+            es_count = len(es_ids)
+            log.info("ES: %d records", es_count)
         except Exception as e:
-            kafka_failures.append({"id": record_id, "error": str(e)})
-            log.warning("KAFKA_FAILED id=%s error=%s", record_id, e)
+            log.error("ES fetch failed: %s", e)
+            _audit_end(conn, audit_id, "FAILED", {"db_count": db_count}, error=str(e))
+            return True
 
-        if send_count % KAFKA_FLUSH_EVERY == 0:
-            producer.flush(timeout=300)
+        missing       = list(db_ids - es_ids)
+        matched_count = len(db_ids & es_ids)
+        missing_count = len(missing)
+        log.info("Matched: %d | Missing in ES: %d", matched_count, missing_count)
 
-    producer.flush(timeout=300)
+        if not missing:
+            log.info("In sync. Nothing to push.")
+            _audit_end(conn, audit_id, "COMPLETED", {
+                "db_count": db_count, "es_count": es_count,
+                "matched_count": matched_count, "missing_count": 0,
+                "pushed_count": 0,
+            })
+            return False
 
-    not_in_api = len(set(missing) - returned_ids)
+        del db_ids, es_ids
+        gc.collect()
 
-    if kafka_failures:
-        failed_kafka_file = f"failed_kafka_{safe_name}_{ts}.json"
-        with open(failed_kafka_file, "w") as f:
-            json.dump(kafka_failures, f, indent=2, default=str)
-        log.warning("Kafka failures: %d — saved to %s", len(kafka_failures), failed_kafka_file)
+        log.info("Fetching %d records from API and pushing to Kafka (batch=%d)", missing_count, API_BATCH_SIZE)
 
-    if null_field_counts:
-        for field, count in null_field_counts.items():
-            log.warning("Dropped null field '%s': %d records", field, count)
+        objects, api_failures = fetch_objects_from_api(missing, job)
+        api_failed_ids_count  = sum(len(fb["ids"]) for fb in api_failures)
 
-    has_failures = bool(api_failures or kafka_failures)
+        if api_failures:
+            failed_api_file = f"failed_api_{safe_name}_{ts}.json"
+            with open(failed_api_file, "w") as f:
+                json.dump(api_failures, f, indent=2, default=str)
+            for fb in api_failures:
+                log.warning("API_FAILED offset=%d ids=%s", fb["offset"], ",".join(fb["ids"][:3]))
+            log.warning("API failures: %d batches / %d IDs — saved to %s",
+                        len(api_failures), api_failed_ids_count, failed_api_file)
 
-    log.info(
-        "Done | Missing: %d | Fetched: %d | Dropped: %d | Not in API: %d | Pushed: %d | "
-        "API failures: %d | Kafka failures: %d",
-        len(missing), len(returned_ids), dropped_null, not_in_api, pushed,
-        sum(len(fb["ids"]) for fb in api_failures), len(kafka_failures),
-    )
+        pushed            = 0
+        dropped_null      = 0
+        send_count        = 0
+        kafka_failures    = []
+        null_field_counts = {}
+        returned_ids      = set()
 
-    return has_failures
+        def on_send_error(exc, record_id):
+            kafka_failures.append({"id": record_id, "error": str(exc)})
+            log.warning("KAFKA_FAILED id=%s error=%s", record_id, exc)
+
+        for obj in objects:
+            record_id = str(obj.get("clientReferenceId", ""))
+            if record_id:
+                returned_ids.add(record_id)
+
+            bad_field = null_required_field(obj, job["required_fields"])
+            if bad_field:
+                dropped_null += 1
+                null_field_counts[bad_field] = null_field_counts.get(bad_field, 0) + 1
+                continue
+
+            try:
+                payload = {
+                    "RequestInfo":           _KAFKA_REQUEST_INFO,
+                    job["api_response_key"]: obj,
+                }
+                future = producer.send(job["kafka_topic"], key=record_id, value=payload)
+                future.add_errback(lambda exc, rid=record_id: on_send_error(exc, rid))
+                pushed     += 1
+                send_count += 1
+            except Exception as e:
+                kafka_failures.append({"id": record_id, "error": str(e)})
+                log.warning("KAFKA_FAILED id=%s error=%s", record_id, e)
+
+            if send_count % KAFKA_FLUSH_EVERY == 0:
+                producer.flush(timeout=300)
+
+        producer.flush(timeout=300)
+
+        fetched_count       = len(returned_ids)
+        dropped_count       = dropped_null
+        not_in_api_count    = len(set(missing) - returned_ids)
+        pushed_count        = pushed
+        kafka_failure_count = len(kafka_failures)
+
+        if kafka_failures:
+            failed_kafka_file = f"failed_kafka_{safe_name}_{ts}.json"
+            with open(failed_kafka_file, "w") as f:
+                json.dump(kafka_failures, f, indent=2, default=str)
+            log.warning("Kafka failures: %d — saved to %s", kafka_failure_count, failed_kafka_file)
+
+        if null_field_counts:
+            for field, count in null_field_counts.items():
+                log.warning("Dropped null field '%s': %d records", field, count)
+
+        has_failures = bool(api_failures or kafka_failures)
+        status       = "FAILED" if has_failures else "COMPLETED"
+
+        log.info(
+            "Done | Missing: %d | Fetched: %d | Dropped: %d | Not in API: %d | Pushed: %d | "
+            "API failures: %d | Kafka failures: %d",
+            missing_count, fetched_count, dropped_count, not_in_api_count,
+            pushed_count, api_failed_ids_count, kafka_failure_count,
+        )
+
+        _audit_end(conn, audit_id, status, {
+            "db_count":         db_count,
+            "es_count":         es_count,
+            "matched_count":    matched_count,
+            "missing_count":    missing_count,
+            "fetched_count":    fetched_count,
+            "dropped_count":    dropped_count,
+            "not_in_api_count": not_in_api_count,
+            "pushed_count":     pushed_count,
+            "api_failed_ids":   api_failed_ids_count,
+            "kafka_failures":   kafka_failure_count,
+        })
+
+        return has_failures
+
+    except Exception as e:
+        log.error("Unexpected error in job %s: %s", name, e)
+        _audit_end(conn, audit_id, "FAILED", {
+            "db_count": db_count, "es_count": es_count,
+        }, error=str(e))
+        return True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
