@@ -11,12 +11,14 @@ from datetime import datetime
 
 import psycopg2
 import requests
-from dotenv import load_dotenv
 from kafka import KafkaProducer
 from urllib3.exceptions import InsecureRequestWarning
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
-load_dotenv()
+
+with open("config.json") as _f:
+    for _k, _v in json.load(_f).items():
+        os.environ.setdefault(_k, str(_v))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -64,7 +66,7 @@ KAFKA_BOOTSTRAP_SERVERS = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 AUTH_TOKEN              = os.environ["AUTH_TOKEN"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CAMPAIGN CONFIG
+# CAMPAIGN CONFIG — Congo UAT
 # ─────────────────────────────────────────────────────────────────────────────
 
 TEST_USER_KEYWORDS = ["test", "demo", "uat", "qa"]
@@ -81,38 +83,26 @@ def exclude_test_users(alias, individual_table):
 
 JOBS = [
     {
-        "name":             "so / project_task",
-        "tenant_id":        "so",
+        "name":             "cg / household (total household covered + total population)",
+        "tenant_id":        "cg",
         "db_query":         f"""
             SELECT clientreferenceid
-            FROM so.project_task pt
-            JOIN so.project p ON pt.projectid = p.id
-            WHERE pt.status = 'ADMINISTRATION_SUCCESS'
-            AND (pt.isdeleted = false OR pt.isdeleted IS NULL)
-            AND {exclude_test_users("pt", "so.individual")}
-            AND EXISTS (
-                SELECT 1 FROM jsonb_array_elements(pt.additionaldetails->'fields') f
-                WHERE f->>'key' = 'doseIndex' AND f->>'value' = '01'
-            )
+            FROM public.household h
+            WHERE (h.isdeleted = false OR h.isdeleted IS NULL)
+            AND {exclude_test_users("h", "public.individual")}
         """,
         "es_query_body":    {
-            "query": {"bool": {"filter": [
-                {"terms": {"Data.administrationStatus.keyword": ["ADMINISTRATION_SUCCESS"]}},
-                {"bool": {
-                    "should": [{"term": {"Data.additionalDetails.doseIndex.keyword": {"value": "01"}}}],
-                    "minimum_should_match": 1,
-                }},
-            ]}}
+            "query": {"match_all": {}}
         },
-        "es_index":         "so-project-task-index-v1",
-        "es_id_field":      "Data.taskClientReferenceId",
-        "kafka_topic":      "save-project-task",
-        "api_base":         "http://project.egov:8080",
-        "api_search_path":  "/project/task/v1/_search",
-        "api_request_key":  "Task",
-        "api_response_key": "Tasks",
+        "es_index":         "household-index-v1",
+        "es_id_field":      "Data.household.clientReferenceId",
+        "kafka_topic":      "save-household-topic",
+        "api_base":         "http://household.egov:8080",
+        "api_search_path":  "/household/v1/_search",
+        "api_request_key":  "Household",
+        "api_response_key": "Households",
         "api_search_field": "clientReferenceId",
-        "required_fields":  ["clientReferenceId", "projectBeneficiaryClientReferenceId"],
+        "required_fields":  ["clientReferenceId"],
     },
 ]
 
@@ -120,34 +110,27 @@ JOBS = [
 # RUNTIME SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
 
+DRY_RUN = True   # True = fetch only, save to JSON, no Kafka push
+
 ES_SCROLL_TIME    = "5m"
 ES_BATCH_SIZE     = 5000
 API_BATCH_SIZE    = 100
 API_RETRIES       = 3
 KAFKA_FLUSH_EVERY = 1000
 
-REQUEST_INFO = {
-    "apiId":     "Rainmaker",
-    "ver":       ".01",
-    "ts":        None,
-    "action":    "_create",
-    "did":       "1",
-    "key":       "",
-    "msgId":     "reindex",
-    "authToken": AUTH_TOKEN,
-    "userInfo":  None,
-}
-
-# Kafka payloads omit authToken — downstream consumers don't need it
-_KAFKA_REQUEST_INFO = {k: v for k, v in REQUEST_INFO.items() if k != "authToken"}
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _decode_cred(val):
+    try:
+        return base64.b64decode(val).decode()
+    except Exception:
+        return val
+
 def get_es_headers():
-    username = base64.b64decode(ES_USERNAME_B64).decode()
-    password = base64.b64decode(ES_PASSWORD_B64).decode()
+    username = _decode_cred(ES_USERNAME_B64)
+    password = _decode_cred(ES_PASSWORD_B64)
     encoded  = base64.b64encode(f"{username}:{password}".encode()).decode()
     return {
         "Content-Type":  "application/json",
@@ -158,6 +141,7 @@ def get_es_headers():
 def fetch_db_ids(conn, query):
     ids         = set()
     cursor_name = f"db_cur_{uuid.uuid4().hex[:12]}"
+    conn.autocommit = False
     with conn.cursor(name=cursor_name) as cur:
         cur.execute(query)
         while True:
@@ -252,7 +236,8 @@ def fetch_objects_from_api(ids, job):
                     api_url, headers=headers, params=params, json=payload, timeout=60
                 )
                 resp.raise_for_status()
-                objects.extend(resp.json().get(job["api_response_key"], []))
+                data = resp.json()
+                objects.extend(data.get(job["api_response_key"], []))
                 break
             except Exception as e:
                 if attempt == API_RETRIES - 1:
@@ -287,7 +272,7 @@ def make_producer():
         enable_idempotence=True,
         acks="all",
         retries=10,
-        max_in_flight_requests_per_connection=5,
+        max_in_flight_requests_per_connection=1,
         linger_ms=20,
         batch_size=65536,
     )
@@ -348,13 +333,14 @@ def run_job(job, conn, producer, es_headers):
     kafka_failures    = []
     null_field_counts = {}
     returned_ids      = set()
+    dry_run_payloads  = []
 
     def on_send_error(exc, record_id):
         kafka_failures.append({"id": record_id, "error": str(exc)})
         log.warning("KAFKA_FAILED id=%s error=%s", record_id, exc)
 
     for obj in objects:
-        record_id = str(obj.get("clientReferenceId", ""))
+        record_id = str(obj.get(job["api_search_field"], ""))
         if record_id:
             returned_ids.add(record_id)
 
@@ -364,23 +350,32 @@ def run_job(job, conn, producer, es_headers):
             null_field_counts[bad_field] = null_field_counts.get(bad_field, 0) + 1
             continue
 
-        try:
-            payload = {
-                "RequestInfo":           _KAFKA_REQUEST_INFO,
-                job["api_response_key"]: obj,
-            }
-            future = producer.send(job["kafka_topic"], key=record_id, value=payload)
-            future.add_errback(lambda exc, rid=record_id: on_send_error(exc, rid))
-            pushed     += 1
-            send_count += 1
-        except Exception as e:
-            kafka_failures.append({"id": record_id, "error": str(e)})
-            log.warning("KAFKA_FAILED id=%s error=%s", record_id, e)
+        dry_run_payloads.append(obj)
 
-        if send_count % KAFKA_FLUSH_EVERY == 0:
-            producer.flush(timeout=300)
+        if DRY_RUN:
+            pushed += 1
+        else:
+            try:
+                future = producer.send(job["kafka_topic"], key=record_id, value=[obj])
+                future.add_errback(lambda exc, rid=record_id: on_send_error(exc, rid))
+                pushed     += 1
+                send_count += 1
+            except Exception as e:
+                kafka_failures.append({"id": record_id, "error": str(e)})
+                log.warning("KAFKA_FAILED id=%s error=%s", record_id, e)
 
-    producer.flush(timeout=300)
+            if send_count % KAFKA_FLUSH_EVERY == 0:
+                producer.flush(timeout=300)
+
+    payload_file = f"{'dryrun' if DRY_RUN else 'pushed'}_{safe_name}_{ts}.json"
+    with open(payload_file, "w") as f:
+        json.dump(dry_run_payloads, f, indent=2, default=str)
+
+    if DRY_RUN:
+        log.info("DRY RUN — %d payloads saved to %s (nothing pushed to Kafka)", pushed, payload_file)
+    else:
+        producer.flush(timeout=300)
+        log.info("Payloads saved to %s for verification", payload_file)
 
     not_in_api = len(set(missing) - returned_ids)
 
@@ -422,7 +417,7 @@ def main():
             user=DB_USER, password=DB_PASSWORD,
             sslmode=DB_SSLMODE, connect_timeout=DB_CONNECT_TIMEOUT,
         )
-        conn.autocommit = True
+        conn.autocommit = False
     except Exception as e:
         log.error("DB connection failed: %s", e)
         sys.exit(1)
