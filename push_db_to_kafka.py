@@ -126,28 +126,20 @@ API_BATCH_SIZE    = 100
 API_RETRIES       = 3
 KAFKA_FLUSH_EVERY = 1000
 
-REQUEST_INFO = {
-    "apiId":     "Rainmaker",
-    "ver":       ".01",
-    "ts":        None,
-    "action":    "_create",
-    "did":       "1",
-    "key":       "",
-    "msgId":     "reindex",
-    "authToken": AUTH_TOKEN,
-    "userInfo":  None,
-}
-
-# Kafka payloads omit authToken — downstream consumers don't need it
-_KAFKA_REQUEST_INFO = {k: v for k, v in REQUEST_INFO.items() if k != "authToken"}
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _decode_cred(val):
+    try:
+        return base64.b64decode(val).decode()
+    except Exception:
+        return val
+
+
 def get_es_headers():
-    username = base64.b64decode(ES_USERNAME_B64).decode()
-    password = base64.b64decode(ES_PASSWORD_B64).decode()
+    username = _decode_cred(ES_USERNAME_B64)
+    password = _decode_cred(ES_PASSWORD_B64)
     encoded  = base64.b64encode(f"{username}:{password}".encode()).decode()
     return {
         "Content-Type":  "application/json",
@@ -158,6 +150,7 @@ def get_es_headers():
 def fetch_db_ids(conn, query):
     ids         = set()
     cursor_name = f"db_cur_{uuid.uuid4().hex[:12]}"
+    conn.autocommit = False
     with conn.cursor(name=cursor_name) as cur:
         cur.execute(query)
         while True:
@@ -252,7 +245,8 @@ def fetch_objects_from_api(ids, job):
                     api_url, headers=headers, params=params, json=payload, timeout=60
                 )
                 resp.raise_for_status()
-                objects.extend(resp.json().get(job["api_response_key"], []))
+                data = resp.json()
+                objects.extend(data.get(job["api_response_key"], []))
                 break
             except Exception as e:
                 if attempt == API_RETRIES - 1:
@@ -287,7 +281,7 @@ def make_producer():
         enable_idempotence=True,
         acks="all",
         retries=10,
-        max_in_flight_requests_per_connection=5,
+        max_in_flight_requests_per_connection=1,
         linger_ms=20,
         batch_size=65536,
     )
@@ -354,7 +348,7 @@ def run_job(job, conn, producer, es_headers):
         log.warning("KAFKA_FAILED id=%s error=%s", record_id, exc)
 
     for obj in objects:
-        record_id = str(obj.get("clientReferenceId", ""))
+        record_id = str(obj.get(job["api_search_field"], ""))
         if record_id:
             returned_ids.add(record_id)
 
@@ -365,11 +359,7 @@ def run_job(job, conn, producer, es_headers):
             continue
 
         try:
-            payload = {
-                "RequestInfo":           _KAFKA_REQUEST_INFO,
-                job["api_response_key"]: obj,
-            }
-            future = producer.send(job["kafka_topic"], key=record_id, value=payload)
+            future = producer.send(job["kafka_topic"], key=record_id, value=[obj])
             future.add_errback(lambda exc, rid=record_id: on_send_error(exc, rid))
             pushed     += 1
             send_count += 1
@@ -422,7 +412,7 @@ def main():
             user=DB_USER, password=DB_PASSWORD,
             sslmode=DB_SSLMODE, connect_timeout=DB_CONNECT_TIMEOUT,
         )
-        conn.autocommit = True
+        conn.autocommit = False
     except Exception as e:
         log.error("DB connection failed: %s", e)
         sys.exit(1)
